@@ -6,6 +6,10 @@
 
 Minimalistic DNS server which serves as an upstream proxy and ad blocker. Written in Go, inspired by [Pi-hole®](https://github.com/pi-hole/pi-hole).
 
+- 增加了并行请求dns的功能，适用于高丢包环境。
+- 并发请求上游dns服务器，如果有一个返回了，取消其他pending的请求。
+- 默认缓存dns结果30分钟
+
 ## Features
 * Minimalistic DNS server, written in Golang, optimized for high performance
 * Blacklist DNS names via user-specific source lists
@@ -22,14 +26,12 @@ Incoming queries from your clients are checked against a list of unwanted domain
 
 As an additional feature, you can set a list of custom hostnames/domain names to be resolved to specific IP addresses. This is useful for accessing services on your local network by name instead of their IP addresses.
 
-## Usage
-1. Create a ```config.yaml``` file. Use the [config.yaml](https://github.com/virtualzone/go-hole/blob/main/config.yaml) in this repository as a template and customize is according to your needs.
-1. Run Go-hole using Docker and mount your previously created ```config.yaml```:
-    ```bash
-    docker run \
-        --rm \
-        --mount type=bind,source=${PWD}/config.yaml,target=/app/config.yaml \
-        -p 53:53/udp \
-        ghcr.io/virtualzone/go-hole:latest
-    ```
-1. Set Go-hole as your network's DNS server (i.e. in your DHCP server's configuration).
+
+## 构建
+go build -ldflags="-w -s" -o ./gohole src/*.go
+
+## 配置 config.yml
+参考项目的config.yaml
+
+## 运行
+./gohole

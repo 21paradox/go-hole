@@ -20,7 +20,7 @@ type ConfigLocalAddress struct {
 }
 
 type Config struct {
-	ListenAddr          string               `yaml:"listen"`
+	ListenAddr          []string             `yaml:"listen"`
 	UpstreamDNS         []string             `yaml:"upstream"`
 	BlacklistSources    []string             `yaml:"blacklist"`
 	BlacklistRenewal    int                  `yaml:"blacklistRenewal"`
@@ -56,10 +56,10 @@ func (c *Config) ReadConfigData(data []byte) {
 }
 
 func (c *Config) ReadEnv() {
-	listenAddr := c.getEnv("LISTEN_ADDR", "")
-	if listenAddr != "" {
-		c.ListenAddr = listenAddr
-	}
+	// listenAddr := c.getEnv("LISTEN_ADDR", "")
+	// if listenAddr != "" {
+	// 	c.ListenAddr = listenAddr
+	// }
 	for i := 1; i <= 10; i++ {
 		server := c.getEnv("UPSTREAM_DNS_"+strconv.Itoa(i), "")
 		if server != "" {
