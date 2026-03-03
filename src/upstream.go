@@ -8,7 +8,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 
 /* ---------- 1. 每个 upstream 的“可重连”连接 ---------- */
 type udpUpStream struct {
+	pool chan *dns.Conn
 	addr string
 	// conn *dns.Conn // 长连接
 }
@@ -26,15 +26,51 @@ var (
 	upstreams []*udpUpStream
 )
 
-// 程序启动时调用一次
-func InitUpstreams(addrs []string) {
-	for _, a := range addrs {
-		// conn, err := dns.Dial("udp", a)
-		// if err != nil {
-		upstreams = append(upstreams, &udpUpStream{addr: a})
-		// }
+// 连接池大小，与 queryUpstream 中的 maxInflightPerUpstream 一致
+const connPoolSize = 5
+
+// bindToVirbr1 返回绑定到 virbr1 的 dialer
+func bindToVirbr1() *net.Dialer {
+	return &net.Dialer{
+		KeepAliveConfig: net.KeepAliveConfig{Enable: false},
+		// Control: func(network, address string, c syscall.RawConn) error {
+		// 	return c.Control(func(fd uintptr) {
+		// 		syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, "virbr1")
+		// 	})
+		// },
 	}
 }
+
+// 程序启动时调用一次
+func InitUpstreams(addrs []string) {
+	dialer := bindToVirbr1()
+	for _, a := range addrs {
+		u := &udpUpStream{addr: a, pool: make(chan *dns.Conn, connPoolSize)}
+		// 预创建连接池
+		for i := 0; i < connPoolSize; i++ {
+			conn := new(dns.Conn)
+			netconn, err := dialer.DialContext(context.Background(), "udp", a)
+			if err != nil {
+				log.Printf("[upstream] 初始化连接失败 %s: %v", a, err)
+				continue
+			}
+			conn.Conn = netconn
+			u.pool <- conn
+		}
+		upstreams = append(upstreams, u)
+	}
+}
+
+func UpdateUpstreams(addr string) {
+	for _, a := range upstreams {
+		if a.addr == addr {
+			return // 已存在
+		}
+	}
+	// 新增 upstream，初始化连接池
+	InitUpstreams([]string{addr})
+}
+
 func cacheKeyFromReq(req *dns.Msg) string {
 	if req == nil || len(req.Question) == 0 {
 		return ""
@@ -101,53 +137,74 @@ func queryUpstream(req *dns.Msg) (*dns.Msg, error) {
 	// case <-ctx.Done():
 	// }
 
-	ch := make(chan result, 5)
-	reqCount := atomic.Int32{}
-	reqCount.Store(0)
-	var requestFn func(ctx context.Context, uc *udpUpStream)
-	requestFn = func(ctx context.Context, uc *udpUpStream) {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		reply, err := queryOneUdp(ctx, uc, req)
-		select {
-		case ch <- result{reply: reply, err: err}:
-		default:
-		}
-		reqCount.Add(1)
-		if err != nil {
-			if strings.Contains(err.Error(), "timeout") {
-			} else {
-				log.Printf("[upstream] %s [domain] send error: %v", uc.addr, err)
-			}
-			return
-		}
-	}
+	ch := make(chan result, len(upstreams))
+
+	// 每个 upstream 的并发控制：最大同时飞行请求数
+	const maxInflightPerUpstream = 5
+	// 每次重试间隔（指数退避基础值）
+	const baseRetryInterval = 50 * time.Millisecond
+
+	var wg sync.WaitGroup
 
 	for _, u := range upstreams {
-		// log.Printf("[upstreamloop] %s use addr: ", u.addr)
 		u := u
+		wg.Add(1)
 
-		go requestFn(ctx, u)
 		go func() {
-			u1 := u
-			for {
+			defer wg.Done()
+
+			// 信号量控制该 upstream 的并发数
+			semaphore := make(chan struct{}, maxInflightPerUpstream)
+
+			for attempt := 0; attempt < 20; attempt++ {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(100 * time.Millisecond):
-					if reqCount.Load() > int32(len(upstreams)*4) {
-						log.Printf("[upstream] %s count check > 10", u.addr)
-						cancel()
+				default:
+				}
+
+				// 获取信号量（阻塞直到有空位）
+				semaphore <- struct{}{}
+
+				go func(attemptNum int) {
+					defer func() { <-semaphore }()
+
+					reply, err := queryOneUdp(ctx, u, req)
+					if err != nil {
+						// 只有非超时错误才记录，超时是预期的
+						if !strings.Contains(err.Error(), "timeout") && !strings.Contains(err.Error(), "context canceled") {
+							log.Printf("[upstream] %s attempt %d error: %v", u.addr, attemptNum, err)
+						}
 						return
 					}
-					go requestFn(ctx, u1)
+					// 成功：发送结果并取消其他请求（检查 ctx 避免无效发送）
+					if ctx.Err() != nil {
+						return
+					}
+					select {
+					case ch <- result{reply: reply, err: nil}:
+						GetUpstreamCache().Set(cachekey, reply)
+						cancel()
+					default:
+					}
+				}(attempt)
+
+				// 指数退避：50ms, 100ms, 150ms... 避免 thundering herd
+				sleepDuration := time.Duration(attempt+1) * baseRetryInterval
+				if sleepDuration > 500*time.Millisecond {
+					sleepDuration = 500 * time.Millisecond
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(sleepDuration):
 				}
 			}
 		}()
 	}
+
+	// 不需要关闭 ch，wg 只用于确保 goroutine 收敛，ch 随函数返回被 GC
 
 	select {
 	case res := <-ch:
@@ -204,19 +261,15 @@ func queryOneUdp(ctx context.Context, u *udpUpStream, req *dns.Msg) (*dns.Msg, e
 	client.WriteTimeout = 5 * time.Second
 	// client.Timeout = 10
 
-	// conn, err := dns.Dial("udp", u.addr)
-	dialer := net.Dialer{
-		KeepAliveConfig: net.KeepAliveConfig{
-			Enable: false,
-		},
+	// 从连接池获取连接
+	var conn *dns.Conn
+	select {
+	case conn = <-u.pool:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-
-	conn := new(dns.Conn)
-	netconn, err := dialer.DialContext(ctx, "udp", u.addr)
-	if err != nil {
-		return nil, err
-	}
-	conn.Conn = netconn
+	// 使用完后归还连接池
+	defer func() { u.pool <- conn }()
 
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(strings.ToLower(req.Question[0].Name)), req.Question[0].Qtype)
@@ -232,43 +285,55 @@ func queryOneUdp(ctx context.Context, u *udpUpStream, req *dns.Msg) (*dns.Msg, e
 	reply, _, err := client.ExchangeWithConnContext(ctx, m, conn)
 	// log.Printf("[queryOneudp]  err %v %s", err, u.addr)
 	if err != nil {
+		// 连接可能断开，创建新连接替换
+		if isConnLost(err) {
+			conn.Conn.Close()
+			// 异步重建连接放回池中
+			go func() {
+				dialer := bindToVirbr1()
+				if newConn, err := dialer.DialContext(context.Background(), "udp", u.addr); err == nil {
+					u.pool <- &dns.Conn{Conn: newConn}
+				} else {
+					log.Printf("[upstream] 重建连接失败 %s: %v", u.addr, err)
+				}
+			}()
+			// 当前请求返回错误，由上层重试
+		}
 		return nil, err
 	}
 	return reply, nil
 }
 
 // /* 单次撞击，逻辑同上，但不再递归 */
-func queryUpstreamOnce(req *dns.Msg) (*dns.Msg, error) {
-	cachekey := cacheKeyFromReq(req)
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(strings.ToLower(req.Question[0].Name)), req.Question[0].Qtype)
-	m.RecursionDesired = true
-	ctx, cancel := context.WithTimeout(context.Background(), 8000*time.Millisecond)
-	defer cancel()
+// func queryUpstreamOnce(req *dns.Msg) (*dns.Msg, error) {
+// 	cachekey := cacheKeyFromReq(req)
+// 	m := new(dns.Msg)
+// 	m.SetQuestion(dns.Fqdn(strings.ToLower(req.Question[0].Name)), req.Question[0].Qtype)
+// 	m.RecursionDesired = true
+// 	ctx, cancel := context.WithTimeout(context.Background(), 8000*time.Millisecond)
+// 	defer cancel()
 
-	ch := make(chan *dns.Msg, 1)
-	var once sync.Once
-	for _, u := range upstreams {
-		u := u
-		go func() {
-			c := &dns.Client{Timeout: 5000 * time.Millisecond}
-			conn, err := dns.Dial("udp", u.addr)
-			reply, _, err := c.ExchangeWithConnContext(ctx, m, conn)
-			log.Printf("[queryStreamOne] recv: %v, %v", reply, err)
+// 	ch := make(chan *dns.Msg, 1)
+// 	var once sync.Once
+// 	for _, u := range upstreams {
+// 		u := u
+// 		go func() {
+// 			reply, err := queryOneUdp(ctx, u, req)
+// 			log.Printf("[queryStreamOne] recv: %v, %v", reply, err)
 
-			if err == nil && reply != nil {
-				once.Do(func() {
-					ch <- reply
-					cancel()
-				})
-			}
-		}()
-	}
-	select {
-	case reply := <-ch:
-		GetUpstreamCache().Set(cachekey, reply)
-		return reply, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("retry still failed for %s", cachekey)
-	}
-}
+// 			if err == nil && reply != nil {
+// 				once.Do(func() {
+// 					ch <- reply
+// 					cancel()
+// 				})
+// 			}
+// 		}()
+// 	}
+// 	select {
+// 	case reply := <-ch:
+// 		GetUpstreamCache().Set(cachekey, reply)
+// 		return reply, nil
+// 	case <-ctx.Done():
+// 		return nil, fmt.Errorf("retry still failed for %s", cachekey)
+// 	}
+// }
